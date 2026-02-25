@@ -1,6 +1,6 @@
 # dataset settings
 dataset_type = 'CocoDataset'
-data_root = '/srv/scratch/z5428587/data_processed/Global/Annotated/variants/segment/planet_nearmap_c448_ov35_kf20_10075-single_seed0/'
+data_root = '/srv/scratch/z5428587/data_processed/Global/Annotated/variants/segment/planet_nearmap_c448_ov35_kf20_10075-single_seed0'
 classes = ('foreground', )
 metainfo = dict(classes=classes)
 backend_args = None
