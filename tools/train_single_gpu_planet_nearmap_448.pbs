@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+#PBS -N mmdet_train
+#PBS -l select=1:ncpus=6:ngpus=1:mem=32gb:gpu_model=A100
+#PBS -l walltime=11:00:00
+#PBS -M z5428587@ad.unsw.edu.au
+#PBS -m abe
+#PBS -j oe
+
+set -euo pipefail
+
+module load gcc/11
+
+# Micromamba configuration (can be overridden via qsub -v)
+export MAMBA_EXE="${MAMBA_EXE:-/srv/scratch/z5428587/mamba/bin/micromamba}"
+export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-/srv/scratch/z5428587/mamba}"
+ENV_NAME="${ENV_NAME:-mmdet}"
+
+echo "Using micromamba from: $MAMBA_EXE"
+echo "Root prefix: $MAMBA_ROOT_PREFIX"
+
+# Initialize micromamba shell hook if available
+if [ -x "$MAMBA_EXE" ]; then
+    __mamba_setup="$("$MAMBA_EXE" shell hook --shell bash --root-prefix "$MAMBA_ROOT_PREFIX" 2>/dev/null || true)"
+    if [ -n "$__mamba_setup" ]; then
+        eval "$__mamba_setup"
+        if micromamba activate "$ENV_NAME"; then
+            echo "Environment activated: $ENV_NAME"
+        else
+            echo "ERROR: Failed to activate environment '$ENV_NAME'"
+            exit 1
+        fi
+    else
+        echo "ERROR: Failed to initialize micromamba shell hook."
+        exit 1
+    fi
+else
+    echo "WARNING: micromamba not found at $MAMBA_EXE. Continuing without activation."
+fi
+
+REPO_ROOT="${REPO_ROOT:-${PBS_O_WORKDIR:-$(cd "$(dirname "$0")/.." && pwd)}}"
+cd "$REPO_ROOT"
+
+# Debug: Print job information
+echo "========================================="
+echo "Job started at: $(date)"
+echo "Job ID: ${PBS_JOBID:-N/A}"
+echo "Job name: ${PBS_JOBNAME:-N/A}"
+echo "Node: $(hostname)"
+echo "Repo root: $REPO_ROOT"
+echo "Python: $(which python)"
+echo "Python version: $(python --version 2>&1)"
+echo "========================================="
+
+CONFIG_ARG="${1:-}"
+CONFIG_PATH="${CONFIG_YAML:-${CONFIG:-$CONFIG_ARG}}"
+if [ -z "$CONFIG_PATH" ]; then
+    echo "Usage:"
+    echo "  qsub -V -v \"CONFIG_YAML=<config.py>\" tools/train_single_gpu_planet_nearmap_448.pbs"
+    echo "  qsub -V -v \"CONFIG=<config.py>\" tools/train_single_gpu_planet_nearmap_448.pbs"
+    echo "  (fallback) qsub tools/train_single_gpu_planet_nearmap_448.pbs -- <config.py> [extra train.py args]"
+    exit 1
+fi
+
+if [ "${1:-}" = "$CONFIG_PATH" ]; then
+    shift
+fi
+
+if [ ! -f "$CONFIG_PATH" ]; then
+    if [ -f "$REPO_ROOT/$CONFIG_PATH" ]; then
+        CONFIG_PATH="$REPO_ROOT/$CONFIG_PATH"
+    else
+        echo "ERROR: Config file not found: $CONFIG_PATH"
+        exit 1
+    fi
+fi
+
+RUN_NAME="$(basename "${CONFIG_PATH%.py}")"
+WORK_DIR_BASE="${WORK_DIR_BASE:-/srv/scratch/z5428587/runs/mmdet/segment}"
+WORK_DIR="${WORK_DIR_BASE%/}/${RUN_NAME}"
+mkdir -p "$WORK_DIR"
+
+SEED="${SEED:-}"
+AMP="${AMP:-0}"
+RESUME="${RESUME:-}"
+TEST_AFTER_TRAIN="${TEST_AFTER_TRAIN:-1}"
+TEST_CHECKPOINT="${TEST_CHECKPOINT:-}"
+INFERENCE_ONLY="${INFERENCE_ONLY:-0}"
+WANDB_NAME="${WANDB_NAME:-$RUN_NAME}"
+EMAIL_TO="${EMAIL_TO:-z5428587@ad.unsw.edu.au}"
+JOB_TAG="${PBS_JOBID:-manual_$$}"
+STDOUT_LOG="${WORK_DIR}/${RUN_NAME}_${JOB_TAG}.out.log"
+STDERR_LOG="${WORK_DIR}/${RUN_NAME}_${JOB_TAG}.err.log"
+TEST_DIR="${WORK_DIR}/test_artifacts"
+TEST_OUT="${TEST_DIR}/predictions.pkl"
+TEST_STDOUT_LOG="${WORK_DIR}/${RUN_NAME}_${JOB_TAG}.test.out.log"
+TEST_STDERR_LOG="${WORK_DIR}/${RUN_NAME}_${JOB_TAG}.test.err.log"
+
+send_failure_email() {
+    local exit_code="$1"
+    local subject="MMDet PBS FAILED: ${RUN_NAME} (job ${PBS_JOBID:-N/A})"
+    local body_file
+    body_file="$(mktemp)"
+
+    {
+        echo "MMDetection training failed."
+        echo "Time: $(date)"
+        echo "Job ID: ${PBS_JOBID:-N/A}"
+        echo "Job Name: ${PBS_JOBNAME:-N/A}"
+        echo "Host: $(hostname)"
+        echo "Repo: $REPO_ROOT"
+        echo "Config: $CONFIG_PATH"
+        echo "Work dir: $WORK_DIR"
+        echo "Exit code: $exit_code"
+        echo "Stdout log: $STDOUT_LOG"
+        echo "Stderr log: $STDERR_LOG"
+        echo
+        echo "Command:"
+        printf '  %q' "${cmd[@]}"
+        echo
+        echo
+        echo "----- BEGIN STDERR (full) -----"
+        if [ -s "$STDERR_LOG" ]; then
+            cat "$STDERR_LOG"
+        else
+            echo "(stderr log is empty)"
+        fi
+        echo "----- END STDERR -----"
+    } > "$body_file"
+
+    if command -v mail >/dev/null 2>&1; then
+        mail -s "$subject" "$EMAIL_TO" < "$body_file"
+    elif command -v mailx >/dev/null 2>&1; then
+        mailx -s "$subject" "$EMAIL_TO" < "$body_file"
+    elif command -v sendmail >/dev/null 2>&1; then
+        {
+            echo "To: $EMAIL_TO"
+            echo "Subject: $subject"
+            echo
+            cat "$body_file"
+        } | sendmail -t
+    else
+        echo "WARNING: No mail tool found (mail/mailx/sendmail). Cannot send failure email."
+        echo "Failure details are in: $STDERR_LOG"
+    fi
+
+    rm -f "$body_file"
+}
+
+is_true() {
+    [ "$1" = "1" ] || [ "$1" = "true" ] || [ "$1" = "TRUE" ]
+}
+
+echo "Config: $CONFIG_PATH"
+echo "Work dir: $WORK_DIR"
+echo "Extra args: $*"
+echo "W&B run name: ${WANDB_NAME}"
+echo "Inference-only mode: $INFERENCE_ONLY"
+echo "Run test after train: $TEST_AFTER_TRAIN"
+echo "Test checkpoint override: ${TEST_CHECKPOINT:-<auto>}"
+echo "Email on failure: $EMAIL_TO"
+echo "Single-node/single-GPU: yes"
+echo "GPU information:"
+nvidia-smi || echo "Warning: nvidia-smi not available"
+echo "========================================="
+
+export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
+export WANDB_NAME
+cmd=(
+    python tools/train.py
+    "$CONFIG_PATH"
+    --work-dir "$WORK_DIR"
+)
+
+if [ -n "$SEED" ]; then
+    cmd+=(--cfg-options "randomness.seed=$SEED")
+fi
+
+if [ "$AMP" = "1" ] || [ "$AMP" = "true" ] || [ "$AMP" = "TRUE" ]; then
+    cmd+=(--amp)
+fi
+
+if [ -n "$RESUME" ]; then
+    if [ "$RESUME" = "auto" ]; then
+        cmd+=(--resume)
+    else
+        cmd+=(--resume "$RESUME")
+    fi
+fi
+
+if [ "$#" -gt 0 ]; then
+    cmd+=("$@")
+fi
+
+echo "Command:"
+printf '  %q' "${cmd[@]}"
+echo
+
+if is_true "$INFERENCE_ONLY"; then
+    echo "Inference-only mode enabled. Skipping training."
+else
+    : > "$STDOUT_LOG"
+    : > "$STDERR_LOG"
+
+    set +e
+    "${cmd[@]}" >> "$STDOUT_LOG" 2>> "$STDERR_LOG"
+    train_exit=$?
+    set -e
+
+    if [ "$train_exit" -ne 0 ]; then
+        echo "Training failed with exit code $train_exit"
+        echo "----- BEGIN STDERR (full) -----"
+        cat "$STDERR_LOG"
+        echo "----- END STDERR -----"
+        send_failure_email "$train_exit" || true
+        exit "$train_exit"
+    fi
+
+    echo "Training completed successfully."
+fi
+
+RUN_TEST="$TEST_AFTER_TRAIN"
+if is_true "$INFERENCE_ONLY"; then
+    RUN_TEST="1"
+fi
+
+if is_true "$RUN_TEST"; then
+    mkdir -p "$TEST_DIR"
+
+    CKPT_PATH="$TEST_CHECKPOINT"
+    if [ -z "$CKPT_PATH" ]; then
+        CKPT_PATH="$(ls -1t "$WORK_DIR"/*best*.pth 2>/dev/null | head -n 1 || true)"
+        if [ -z "$CKPT_PATH" ] && [ -f "$WORK_DIR/latest.pth" ]; then
+            CKPT_PATH="$WORK_DIR/latest.pth"
+        elif [ -z "$CKPT_PATH" ]; then
+            CKPT_PATH="$(ls -1t "$WORK_DIR"/epoch_*.pth 2>/dev/null | head -n 1 || true)"
+        fi
+    fi
+
+    if [ -z "$CKPT_PATH" ] || [ ! -f "$CKPT_PATH" ]; then
+        echo "ERROR: Cannot find checkpoint for test inference."
+        echo "Checked TEST_CHECKPOINT, then *best*.pth, then $WORK_DIR/latest.pth, then epoch_*.pth"
+        exit 1
+    fi
+
+    test_cmd=(
+        python tools/test.py
+        "$CONFIG_PATH"
+        "$CKPT_PATH"
+        --work-dir "$TEST_DIR"
+        --out "$TEST_OUT"
+    )
+
+    echo "Test command:"
+    printf '  %q' "${test_cmd[@]}"
+    echo
+
+    : > "$TEST_STDOUT_LOG"
+    : > "$TEST_STDERR_LOG"
+
+    set +e
+    "${test_cmd[@]}" >> "$TEST_STDOUT_LOG" 2>> "$TEST_STDERR_LOG"
+    test_exit=$?
+    set -e
+
+    if [ "$test_exit" -ne 0 ]; then
+        echo "Post-train test inference failed with exit code $test_exit"
+        echo "----- BEGIN TEST STDERR (full) -----"
+        cat "$TEST_STDERR_LOG"
+        echo "----- END TEST STDERR -----"
+        exit "$test_exit"
+    fi
+
+    echo "Test inference completed successfully."
+    echo "Predictions saved to: $TEST_OUT"
+fi
+
+echo "Stdout log: $STDOUT_LOG"
+echo "Stderr log: $STDERR_LOG"
