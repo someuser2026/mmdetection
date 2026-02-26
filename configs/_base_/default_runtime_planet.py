@@ -8,7 +8,7 @@ default_hooks = dict(
         type='CheckpointHook',
         interval=1,
         max_keep_ckpts=1,
-        save_best='segm_mAP_50',
+        save_best='coco/segm_mAP_50',
         rule='greater'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='DetVisualizationHook'))
