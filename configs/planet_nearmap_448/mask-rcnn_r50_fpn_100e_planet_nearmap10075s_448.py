@@ -6,6 +6,12 @@ _base_ = [
 ]
 
 model = dict(
+    rpn_head=dict(
+        anchor_generator=dict(
+            type='AnchorGenerator',
+            scales=[1, 2, 4],
+            ratios=[0.5, 1.0, 2.0],
+            strides=[4, 8, 16, 32, 64])),
     roi_head=dict(
         bbox_head=dict(
             type='Shared2FCBBoxHead',
