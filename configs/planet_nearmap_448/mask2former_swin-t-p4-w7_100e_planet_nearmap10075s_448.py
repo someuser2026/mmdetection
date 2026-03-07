@@ -30,6 +30,7 @@ custom_keys.update({
 })
 
 optim_wrapper = dict(
+    _delete_=True,
     type='OptimWrapper',
     optimizer=dict(
         type='AdamW',
